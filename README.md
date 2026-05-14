@@ -1,4 +1,4 @@
-# Okta Password Status for Platoform SSO on macOS
+# Okta Password Status for Platform SSO
 
 > Retrieve Okta password expiry data via the Okta Users API using OAuth 2.0 `private_key_jwt` authentication.  
 > Persist the result to a local plist for Jamf Pro Extension Attribute reporting and Smart Group targeting.
