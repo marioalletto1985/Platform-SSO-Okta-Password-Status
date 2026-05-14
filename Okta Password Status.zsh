@@ -1,43 +1,38 @@
 #!/bin/zsh --no-rcs
+# shellcheck shell=bash
 #
-# Zilch - Okta Password Status
-# Queries Okta Users API and persists password data to local plist.
-# Deployed via Jamf Pro — runs at login / recurring check-in (daily).
+# Okta Password Status
+# OAuth 2.0 private_key_jwt | python3 JSON parsing | System Keychain
 #
-# Version: 1.0.0
-# Author: Zilch Platform Engineering
-# Created: 2026-05-13
+# Version: 2.0.0
+# Author: Mario Alletto
 #
 # Jamf Pro Parameters:
-#   $4 = Okta SSWS API Token
-#   $5 = Okta Domain (default: payzilch.okta.com)
+#   $4 = Client ID
+#   $5 = Okta Domain (default: yourorg.okta.com)
 #   $6 = Password Max Age Days (default: 90)
 #
-###############################################################################
+# Keychain (seeded via separate policy):
+#   Service: com.yourorg.okta.passwordstatus
+#   Account: private-key → base64-encoded PEM
+#   Account: key-id → Okta kid
+#
 
-###############################################################################
-# Variables
-###############################################################################
-
-readonly SCRIPT_NAME="Zilch Okta Password Status"
-readonly SCRIPT_VERSION="1.0.0"
-readonly LOG_FILE="/var/log/zilch_password_status.log"
+readonly SCRIPT_NAME="yourorg Okta Password Status"
+readonly SCRIPT_VERSION="2.0.0"
+readonly LOG_FILE="/var/log/yourorg_password_status.log"
 
 readonly LOGGED_IN_USER=$(scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }')
 readonly LOGGED_IN_UID=$(id -u "$LOGGED_IN_USER" 2>/dev/null)
 
-readonly PLIST_DIR="/Library/Application Support/Zilch"
-readonly PLIST_FILE="${PLIST_DIR}/com.zilch.passwordstatus.plist"
+readonly PLIST_DIR="/Library/Application Support/yourorg"
+readonly PLIST_FILE="${PLIST_DIR}/com.yourorg.passwordstatus.plist"
 
-readonly JQ_PATH="/usr/local/bin/jq"
-readonly JQ_INSTALL_POLICY="install_jq"
+readonly KEYCHAIN_SERVICE="com.yourorg.okta.passwordstatus"
+readonly KEYCHAIN_PATH="/Library/Keychains/System.keychain"
 
-###############################################################################
-# Jamf Pro Parameters
-###############################################################################
-
-OKTA_API_TOKEN="${4}"
-OKTA_DOMAIN="${5:-payzilch.okta.com}"
+OKTA_CLIENT_ID="${4}"
+OKTA_DOMAIN="${5:-yourorg.okta.com}"
 PASSWORD_MAX_AGE_DAYS="${6:-90}"
 
 ###############################################################################
@@ -53,17 +48,35 @@ function log_warn()  { log_message "WARN" "$1"; }
 function log_error() { log_message "ERROR" "$1"; }
 
 ###############################################################################
-# Pre-flight
+# JSON Helper (python3 — no external dependencies)
 ###############################################################################
 
-function check_prerequisites() {
-    if [[ ! -x "$JQ_PATH" ]]; then
-        log_info "jq not found — triggering install policy"
-        /usr/local/bin/jamf policy -trigger "${JQ_INSTALL_POLICY}"
-        [[ ! -x "$JQ_PATH" ]] && { log_error "jq install failed"; exit 1; }
-    fi
-    [[ ! -d "$PLIST_DIR" ]] && { mkdir -p "$PLIST_DIR"; chmod 755 "$PLIST_DIR"; }
+function json_get() {
+    local json="$1" key="$2" default="${3:-null}"
+    echo "$json" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    keys = '${key}'.split('.')
+    val = data
+    for k in keys:
+        if isinstance(val, dict):
+            val = val.get(k)
+        else:
+            val = None
+            break
+    if val is None:
+        print('${default}')
+    else:
+        print(val)
+except:
+    print('${default}')
+" 2>/dev/null
 }
+
+###############################################################################
+# Pre-flight
+###############################################################################
 
 function check_logged_in_user() {
     if [[ -z "$LOGGED_IN_USER" ]] || [[ "$LOGGED_IN_USER" == "loginwindow" ]]; then
@@ -74,8 +87,80 @@ function check_logged_in_user() {
 }
 
 function validate_parameters() {
-    [[ -z "$OKTA_API_TOKEN" ]] && { log_error "Parameter 4 (SSWS token) required"; exit 1; }
-    [[ -z "$OKTA_DOMAIN" ]] && { log_error "Parameter 5 (Okta domain) required"; exit 1; }
+    [[ -z "$OKTA_CLIENT_ID" ]] && { log_error "Parameter 4 (Client ID) required"; exit 1; }
+    [[ -z "$OKTA_DOMAIN" ]] && { log_error "Parameter 5 (Okta Domain) required"; exit 1; }
+}
+
+function check_prerequisites() {
+    command -v python3 &>/dev/null || { log_error "python3 not found"; exit 1; }
+    command -v openssl &>/dev/null || { log_error "openssl not found"; exit 1; }
+    [[ ! -d "$PLIST_DIR" ]] && { mkdir -p "$PLIST_DIR"; chmod 755 "$PLIST_DIR"; }
+}
+
+###############################################################################
+# Keychain
+###############################################################################
+
+function retrieve_keychain_credentials() {
+    PRIVATE_KEY_B64=$(security find-generic-password \
+        -s "$KEYCHAIN_SERVICE" -a "private-key" \
+        -w "$KEYCHAIN_PATH" 2>/dev/null)
+
+    OKTA_KEY_ID=$(security find-generic-password \
+        -s "$KEYCHAIN_SERVICE" -a "key-id" \
+        -w "$KEYCHAIN_PATH" 2>/dev/null)
+
+    if [[ -z "$PRIVATE_KEY_B64" ]] || [[ -z "$OKTA_KEY_ID" ]]; then
+        log_error "Credentials not found in System Keychain — run seed policy first"
+        exit 1
+    fi
+    log_info "Credentials retrieved from System Keychain"
+}
+
+###############################################################################
+# OAuth 2.0 — private_key_jwt
+###############################################################################
+
+function obtain_access_token() {
+    local token_endpoint="https://${OKTA_DOMAIN}/oauth2/v1/token"
+
+    # Build JWT
+    local jwt_header=$(printf '{"alg":"RS256","typ":"JWT","kid":"%s"}' "$OKTA_KEY_ID")
+    local iat=$(date +%s)
+    local exp=$((iat + 300))
+    local jti=$(uuidgen | tr '[:upper:]' '[:lower:]')
+    local jwt_payload=$(printf '{"iss":"%s","sub":"%s","aud":"%s","iat":%s,"exp":%s,"jti":"%s"}' \
+        "$OKTA_CLIENT_ID" "$OKTA_CLIENT_ID" "$token_endpoint" "$iat" "$exp" "$jti")
+
+    local b64_header=$(printf '%s' "$jwt_header" | base64 | tr '+/' '-_' | tr -d '=\n')
+    local b64_payload=$(printf '%s' "$jwt_payload" | base64 | tr '+/' '-_' | tr -d '=\n')
+    local signing_input="${b64_header}.${b64_payload}"
+
+    # Sign — key decoded in memory via process substitution
+    local signature=$(printf '%s' "$signing_input" | \
+        openssl dgst -sha256 -sign <(echo "$PRIVATE_KEY_B64" | base64 -d) 2>/dev/null | \
+        base64 | tr '+/' '-_' | tr -d '=\n')
+
+    [[ -z "$signature" ]] && { log_error "JWT signing failed"; exit 1; }
+
+    local client_assertion="${signing_input}.${signature}"
+
+    # Token request
+    local token_response=$(curl -s -X POST "$token_endpoint" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --data-urlencode "grant_type=client_credentials" \
+        --data-urlencode "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+        --data-urlencode "client_assertion=${client_assertion}" \
+        --data-urlencode "scope=okta.users.read")
+
+    OKTA_ACCESS_TOKEN=$(json_get "$token_response" "access_token" "")
+
+    if [[ -z "$OKTA_ACCESS_TOKEN" ]]; then
+        log_error "Token request failed: $(json_get "$token_response" "error_description" "unknown")"
+        exit 1
+    fi
+
+    log_info "Access token acquired (expires in $(json_get "$token_response" "expires_in" "?")s)"
 }
 
 ###############################################################################
@@ -84,8 +169,7 @@ function validate_parameters() {
 
 function resolve_okta_upn() {
     # Priority 1: Platform SSO
-    local psso_login
-    psso_login=$(app-sso -l 2>/dev/null | grep -i "Login Name" | head -1 | awk -F': ' '{print $2}' | xargs)
+    local psso_login=$(app-sso -l 2>/dev/null | grep -i "Login Name" | head -1 | awk -F': ' '{print $2}' | xargs)
     if [[ -n "$psso_login" ]] && [[ "$psso_login" == *"@"* ]]; then
         OKTA_UPN="$psso_login"
         log_info "UPN via Platform SSO: ${OKTA_UPN}"
@@ -93,8 +177,7 @@ function resolve_okta_upn() {
     fi
 
     # Priority 2: AltSecurityIdentities
-    local alt_id
-    alt_id=$(dscl . read /Users/"${LOGGED_IN_USER}" AltSecurityIdentities 2>/dev/null | grep -i "PlatformSSO" | awk -F':' '{print $NF}' | xargs)
+    local alt_id=$(dscl . read /Users/"${LOGGED_IN_USER}" AltSecurityIdentities 2>/dev/null | grep -i "PlatformSSO" | awk -F':' '{print $NF}' | xargs)
     if [[ -n "$alt_id" ]] && [[ "$alt_id" == *"@"* ]]; then
         OKTA_UPN="$alt_id"
         log_info "UPN via AltSecurityIdentities: ${OKTA_UPN}"
@@ -104,8 +187,7 @@ function resolve_okta_upn() {
     # Priority 3: Okta Verify
     local okta_plist="/Users/${LOGGED_IN_USER}/Library/Application Support/Okta/OktaVerify/UserContext.plist"
     if [[ -f "$okta_plist" ]]; then
-        local email
-        email=$(/usr/libexec/PlistBuddy -c "print :Email" "$okta_plist" 2>/dev/null)
+        local email=$(/usr/libexec/PlistBuddy -c "print :Email" "$okta_plist" 2>/dev/null)
         if [[ -n "$email" ]] && [[ "$email" == *"@"* ]]; then
             OKTA_UPN="$email"
             log_info "UPN via Okta Verify: ${OKTA_UPN}"
@@ -114,8 +196,8 @@ function resolve_okta_upn() {
     fi
 
     # Priority 4: Fallback
-    OKTA_UPN="${LOGGED_IN_USER}@zilch.technology"
-    log_warn "UPN fallback (constructed): ${OKTA_UPN}"
+    OKTA_UPN="${LOGGED_IN_USER}@yourorg.com"
+    log_warn "UPN fallback: ${OKTA_UPN}"
 }
 
 ###############################################################################
@@ -123,33 +205,31 @@ function resolve_okta_upn() {
 ###############################################################################
 
 function okta_get_user() {
-    local response http_code body
-
-    response=$(curl -s -w "\n%{http_code}" \
+    local response=$(curl -s -w "\n%{http_code}" \
         -X GET "https://${OKTA_DOMAIN}/api/v1/users/${OKTA_UPN}" \
-        -H "Authorization: SSWS ${OKTA_API_TOKEN}" \
+        -H "Authorization: Bearer ${OKTA_ACCESS_TOKEN}" \
         -H "Accept: application/json")
 
-    http_code=$(echo "$response" | tail -1)
-    body=$(echo "$response" | sed '$d')
+    local http_code=$(echo "$response" | tail -1)
+    local body=$(echo "$response" | sed '$d')
 
     if [[ "$http_code" -ne 200 ]]; then
         log_error "Okta API HTTP ${http_code} for ${OKTA_UPN}"
-        log_error "Response: ${body}"
+        log_error "$(json_get "$body" "errorSummary" "Unknown error")"
         exit 1
     fi
 
     OKTA_USER_RESPONSE="$body"
-    log_info "Okta user profile retrieved successfully"
+    log_info "User profile retrieved"
 }
 
 function parse_password_status() {
-    OKTA_USER_STATUS=$(echo "$OKTA_USER_RESPONSE" | "$JQ_PATH" -r '.status // "UNKNOWN"')
-    OKTA_PASSWORD_CHANGED=$(echo "$OKTA_USER_RESPONSE" | "$JQ_PATH" -r '.passwordChanged // "null"')
-    OKTA_LAST_LOGIN=$(echo "$OKTA_USER_RESPONSE" | "$JQ_PATH" -r '.lastLogin // "null"')
-    OKTA_CREDENTIAL_PROVIDER=$(echo "$OKTA_USER_RESPONSE" | "$JQ_PATH" -r '.credentials.provider.type // "UNKNOWN"')
+    OKTA_USER_STATUS=$(json_get "$OKTA_USER_RESPONSE" "status" "UNKNOWN")
+    OKTA_PASSWORD_CHANGED=$(json_get "$OKTA_USER_RESPONSE" "passwordChanged" "null")
+    OKTA_LAST_LOGIN=$(json_get "$OKTA_USER_RESPONSE" "lastLogin" "null")
+    OKTA_CREDENTIAL_PROVIDER=$(json_get "$OKTA_USER_RESPONSE" "credentials.provider.type" "UNKNOWN")
 
-    log_info "Status: ${OKTA_USER_STATUS} | Password changed: ${OKTA_PASSWORD_CHANGED}"
+    log_info "Status: ${OKTA_USER_STATUS} | Changed: ${OKTA_PASSWORD_CHANGED}"
 }
 
 ###############################################################################
@@ -166,36 +246,31 @@ function calculate_password_age() {
         return
     fi
 
-    local normalised
-    normalised=$(echo "$password_date" | sed 's/\.[0-9]*Z$/Z/')
+    local normalised=$(echo "$password_date" | sed 's/\.[0-9]*Z$/Z/')
     local pw_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$normalised" "+%s" 2>/dev/null)
 
     if [[ -z "$pw_epoch" ]]; then
         PASSWORD_AGE_DAYS=0
-        log_warn "Could not parse date: ${password_date}"
+        log_warn "Could not parse: ${password_date}"
         return
     fi
 
-    local today_epoch=$(date "+%s")
-    PASSWORD_AGE_DAYS=$(( (today_epoch - pw_epoch) / 86400 ))
+    PASSWORD_AGE_DAYS=$(( ($(date +%s) - pw_epoch) / 86400 ))
     log_info "Password age: ${PASSWORD_AGE_DAYS} days"
 }
 
 function get_local_password_age() {
-    local pw_epoch
-    pw_epoch=$(dscl . read /Users/"${LOGGED_IN_USER}" 2>/dev/null | \
+    local pw_epoch=$(dscl . read /Users/"${LOGGED_IN_USER}" 2>/dev/null | \
         grep -A1 "passwordLastSetTime" | grep "real" | \
         awk -F'real>|</real' '{print $2}' | awk -F'.' '{print $1}')
 
     if [[ -n "$pw_epoch" ]]; then
-        local today_epoch=$(date "+%s")
-        PASSWORD_AGE_DAYS=$(( (today_epoch - pw_epoch) / 86400 ))
+        PASSWORD_AGE_DAYS=$(( ($(date +%s) - pw_epoch) / 86400 ))
         OKTA_PASSWORD_CHANGED=$(date -j -f "%s" "$pw_epoch" "+%Y-%m-%dT%H:%M:%SZ")
-        log_info "Local password age: ${PASSWORD_AGE_DAYS} days"
+        log_info "Local fallback age: ${PASSWORD_AGE_DAYS} days"
     else
         PASSWORD_AGE_DAYS=0
         OKTA_PASSWORD_CHANGED=""
-        log_warn "Could not read local password age"
     fi
 }
 
@@ -216,38 +291,35 @@ function calculate_expiry() {
 }
 
 ###############################################################################
-# Write Plist
+# Plist
 ###############################################################################
 
 function write_plist() {
     local force_recon="false"
+    local existing_date=$(/usr/libexec/PlistBuddy -c "print :PasswordLastChanged" "$PLIST_FILE" 2>/dev/null)
 
-    # Check for date change
-    local existing_date
-    existing_date=$(/usr/libexec/PlistBuddy -c "print :PasswordLastChanged" "$PLIST_FILE" 2>/dev/null)
     if [[ -n "$existing_date" ]] && [[ "$existing_date" != "$OKTA_PASSWORD_CHANGED" ]]; then
         force_recon="true"
     fi
 
-    # Write keys
     local keys=(
         "PasswordLastChanged:string:${OKTA_PASSWORD_CHANGED}"
-        "PasswordAge:string:${PASSWORD_AGE_DAYS}"
+        "PasswordAgeDays:integer:${PASSWORD_AGE_DAYS}"
         "PasswordDaysRemaining:string:${PASSWORD_DAYS_REMAINING}"
-        "PasswordExpired:string:${PASSWORD_EXPIRED}"
-        "PasswordMaxAgeDays:string:${PASSWORD_MAX_AGE_DAYS}"
+        "PasswordExpired:bool:${PASSWORD_EXPIRED}"
+        "PasswordMaxAgeDays:integer:${PASSWORD_MAX_AGE_DAYS}"
         "UserStatus:string:${OKTA_USER_STATUS}"
         "CredentialProvider:string:${OKTA_CREDENTIAL_PROVIDER}"
         "OktaUPN:string:${OKTA_UPN}"
         "LastLogin:string:${OKTA_LAST_LOGIN}"
         "LastChecked:string:$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+        "ScriptVersion:string:${SCRIPT_VERSION}"
     )
 
     for entry in "${keys[@]}"; do
-        local key type value
-        key=$(echo "$entry" | cut -d: -f1)
-        type=$(echo "$entry" | cut -d: -f2)
-        value=$(echo "$entry" | cut -d: -f3-)
+        local key=$(echo "$entry" | cut -d: -f1)
+        local type=$(echo "$entry" | cut -d: -f2)
+        local value=$(echo "$entry" | cut -d: -f3-)
 
         if ! /usr/libexec/PlistBuddy -c "set :${key} ${value}" "$PLIST_FILE" 2>/dev/null; then
             /usr/libexec/PlistBuddy -c "add :${key} ${type} ${value}" "$PLIST_FILE" 2>/dev/null
@@ -257,7 +329,7 @@ function write_plist() {
     chmod 644 "$PLIST_FILE"
     log_info "Plist written: ${PLIST_FILE}"
 
-    [[ "$force_recon" == "true" ]] && { log_info "Triggering inventory update"; /usr/local/bin/jamf recon &; }
+    [[ "$force_recon" == "true" ]] && { log_info "Inventory update triggered"; /usr/local/bin/jamf recon &; }
 }
 
 ###############################################################################
@@ -272,6 +344,8 @@ function main() {
     check_logged_in_user
     validate_parameters
     check_prerequisites
+    retrieve_keychain_credentials
+    obtain_access_token
     resolve_okta_upn
     okta_get_user
     parse_password_status
@@ -279,8 +353,7 @@ function main() {
     calculate_expiry
     write_plist
 
-    log_info "SUMMARY: ${OKTA_UPN} | Status: ${OKTA_USER_STATUS} | Age: ${PASSWORD_AGE_DAYS}d | Remaining: ${PASSWORD_DAYS_REMAINING}d | Expired: ${PASSWORD_EXPIRED}"
-    log_info "Complete"
+    log_info "DONE: ${OKTA_UPN} | Age: ${PASSWORD_AGE_DAYS}d | Remaining: ${PASSWORD_DAYS_REMAINING}d | Expired: ${PASSWORD_EXPIRED}"
     exit 0
 }
 
