@@ -1,5 +1,5 @@
 1. README.md
-markdown
+
 # Okta Password Status for macOS
 
 > Retrieve Okta password expiry data via the Users API using OAuth 2.0 `private_key_jwt` authentication. Persist to a local plist for Jamf Pro Extension Attribute reporting and Smart Group targeting.
@@ -223,7 +223,7 @@ okta-password-status/
     ├── ea_okta_password_age.zsh
     ├── ea_okta_password_days_remaining.zsh
     ├── ea_okta_password_expired.zsh
-    └── ea_okta_user_status.zsh
+    
 Changelog
 2.0.0 — 2026-05-13
 OAuth 2.0 private_key_jwt authentication (no static tokens)
