@@ -9,7 +9,7 @@
 #   $5 = Okta Key ID (kid)
 #
 # Version: 2.0.0
-# Author: yourorg Platform Engineering
+# Author: Mario Alletto - May 2026
 #
 
 readonly KEYCHAIN_SERVICE="com.yourorg.okta.passwordstatus"
